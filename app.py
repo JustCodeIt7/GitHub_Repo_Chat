@@ -10,30 +10,31 @@ from langchain_community.vectorstores import FAISS
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 
-def get_repo_text(repo_url: str) -> str:
+def get_repo_text(repo_url: str, allowed_extensions: set = None) -> str:
     """
     Clone the given GitHub repository and extract text from allowed files.
     Allowed file extensions include common text/code formats.
     """
-    # Define allowed file extensions (you can adjust this set as needed)
-    allowed_extensions = {
-        ".py",
-        ".md",
-        ".txt",
-        ".js",
-        ".html",
-        ".css",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".java",
-        ".c",
-        ".cpp",
-        ".h",
-        ".rb",
-        ".go",
-        ".rs",
-    }
+    # Use provided extensions or fall back to defaults if none selected
+    if not allowed_extensions:
+        allowed_extensions = {
+            ".py",
+            ".md",
+            ".txt",
+            ".js",
+            ".html",
+            ".css",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".java",
+            ".c",
+            ".cpp",
+            ".h",
+            ".rb",
+            ".go",
+            ".rs",
+        }
     repo_texts = []
 
     # Create a temporary directory to clone the repository
@@ -118,9 +119,26 @@ st.title("GitHub Repo Chatbot with LangChain and Ollama")
 repo_url = st.sidebar.text_input(
     "Enter the GitHub repository URL:", value="https://github.com/JustCodeIt7/GitHub_Repo_Chat"
 )
+
+# Define all available file extensions
+all_file_extensions = [
+    ".py", ".md", ".txt", ".js", ".html", ".css", ".json",
+    ".yaml", ".yml", ".java", ".c", ".cpp", ".h", ".rb", ".go", ".rs"
+]
+
+# Multi-select for file extensions
+selected_extensions = st.sidebar.multiselect(
+    "Select file types to include:",
+    all_file_extensions,
+    default=all_file_extensions[:7]  # Default to first 7 file types
+)
+
+# Load repository button
 if st.sidebar.button("Load Repository"):
     with st.spinner("Cloning repository and processing files..."):
-        repo_text = get_repo_text(repo_url)
+        # Convert the selected extensions list to a set for faster lookups
+        allowed_extensions_set = set(selected_extensions)
+        repo_text = get_repo_text(repo_url, allowed_extensions_set)
         if repo_text:
             chunks = split_text(repo_text)
             vectorstore = create_vectorstore(chunks)
