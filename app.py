@@ -3,7 +3,6 @@ import subprocess
 import os
 import tempfile
 
-# from langchain.vectorstores import FAISS
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.chains.question_answering import load_qa_chain
 from langchain_community.vectorstores import FAISS
@@ -131,27 +130,35 @@ if st.sidebar.button("Load Repository"):
             st.error("Failed to retrieve repository content.")
 
 # Initialize chat history if not already set.
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 st.header("Chat with the Repository Content")
 
+# Display chat messages from history
 if "vectorstore" in st.session_state:
-    with st.form("chat_form", clear_on_submit=True):
-        user_question = st.text_input("Your question:")
-        submitted = st.form_submit_button("Send")
-
-    if submitted and user_question:
-        with st.spinner("Generating answer..."):
-            answer = answer_question(user_question, st.session_state.vectorstore)
-            # Append the question-answer pair to chat history.
-            st.session_state.chat_history.append({"question": user_question, "answer": answer})
-
-    if st.session_state.chat_history:
-        st.markdown("### Chat History")
-        for chat in st.session_state.chat_history:
-            st.markdown(f"**You:** {chat['question']}")
-            st.markdown(f"**Bot:** {chat['answer']}")
+    # Display chat messages from history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Accept user input
+    if prompt := st.chat_input("Ask a question about the repository..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate a response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response = answer_question(prompt, st.session_state.vectorstore)
+                st.markdown(response)
+        
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": response})
 else:
     st.info(
         "Please enter a GitHub repository URL in the sidebar and click 'Load Repository' to start."
