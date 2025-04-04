@@ -3,10 +3,10 @@ import subprocess
 import os
 import tempfile
 
-from langchain.vectorstores import FAISS
+# from langchain.vectorstores import FAISS
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.chains.question_answering import load_qa_chain
-
+from langchain_community.vectorstores import FAISS
 # Import Ollama wrappers for embeddings and chat models
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
@@ -101,17 +101,23 @@ def answer_question(query: str, vectorstore) -> str:
 
     # Create a QA chain that stuffs the retrieved documents into the prompt.
     chain = load_qa_chain(llm, chain_type="stuff")
-    answer = chain.run(input_documents=docs, question=query)
-    return answer
+    
+    # Use invoke() with a proper input dictionary instead of run()
+    response = chain.invoke({
+        "input_documents": docs,
+        "question": query
+    })
+    
+    # The response is a dictionary, get the answer text
+    return response["output_text"]
 
 
 # --- Streamlit App Layout ---
-
 st.title("GitHub Repo Chatbot with LangChain and Ollama")
 
 # Sidebar: Input for the GitHub repository URL.
 repo_url = st.sidebar.text_input(
-    "Enter the GitHub repository URL:", value="https://github.com/username/repo"
+    "Enter the GitHub repository URL:", value="https://github.com/JustCodeIt7/GitHub_Repo_Chat"
 )
 if st.sidebar.button("Load Repository"):
     with st.spinner("Cloning repository and processing files..."):
