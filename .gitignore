@@ -176,3 +176,4 @@ cython_debug/
 *-dev
 .chroma_db/
 .DS_Store
+archive/
