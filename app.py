@@ -102,19 +102,20 @@ def index_repo(url, exts, chunk_size, overlap, k):
     # Fetch, split, and create Document objects for each file
     for p in paths:
         if txt := fetch_raw(owner, repo, branch, p):
-            for j, s in enumerate(splitter.split_text(txt)):
-                docs.append(
-                    Document(
-                        page_content=s,
-                        metadata={
-                            "source": p,
-                            "repo": f"{owner}/{repo}",
-                            "branch": branch,
-                            "chunk": j,
-                            "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{p}",
-                        },
-                    )
+            # Split the text into chunks and create Document objects
+            docs.extend(
+                Document(
+                    page_content=s,
+                    metadata={
+                        "source": p,
+                        "repo": f"{owner}/{repo}",
+                        "branch": branch,
+                        "chunk": j,
+                        "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{p}",
+                    },
                 )
+                for j, s in enumerate(splitter.split_text(txt))
+            )
     # Initialize embedding model and vector store
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     vs = Chroma(embedding_function=embeddings)
@@ -209,10 +210,13 @@ if user:
         if used:
             with st.expander("Sources (retrieved snippets)"):
                 seen = set()
+                # Display unique source file paths
                 for d in used:
                     src, url = d.metadata.get("source"), d.metadata.get("url")
+                    # Only show the source if it's not already been seen
                     if src and src not in seen:
                         seen.add(src)
                         st.write(f"- {src}")
+                        # Display the source file's URL
                         if url:
                             st.write(f"  {url}")
