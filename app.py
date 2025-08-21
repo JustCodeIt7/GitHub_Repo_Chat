@@ -1,9 +1,8 @@
 import re, requests, streamlit as st
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.chat_models import ChatOllama
 from langchain_community.vectorstores import Chroma
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 
 ################################ Setup & Configuration ################################
 st.set_page_config(page_title="GitHub Repo Chat (RAG)", page_icon="💬", layout="wide")
@@ -165,82 +164,89 @@ def answer(question, model):
 
 
 ################################ Streamlit UI ################################
-st.title("💬 Chat with a GitHub Repository (LangChain + Chroma + Ollama)")
-st.write(
-    "Ask questions about a repo’s README and code. README is always included; selected file types are embedded for retrieval."
-)
+def main():
+    """Main function to run the Streamlit app."""
 
-with st.sidebar:
-    st.header("Settings")
-    model = st.text_input("Ollama Chat Model", value="llama3.2")
-    k = st.slider("Top-K retrieved chunks", 2, 10, value=4)  # Number of chunks to retrieve for context
-    chunk = st.slider("Chunk size (chars)", 500, 2000, value=1200, step=100)  # Max characters per text chunk
-    overlap = st.slider("Chunk overlap (chars)", 0, 400, value=200, step=50)  # Character overlap between chunks
+    st.title("💬 Chat with a GitHub Repository (LangChain + Chroma + Ollama)")
+    st.write(
+        "Ask questions about a repo’s README and code. README is always included; selected file types are embedded for retrieval."
+    )
 
-# Main panel for repository input and indexing controls.
-default_exts = [".py", ".js", ".ts", ".md", ".txt", ".json", ".yaml", ".yml", ".java", ".go", ".rs"]
-url = st.text_input("GitHub Repository URL", placeholder="https://github.com/owner/repo")
-exts = st.multiselect(
-    "File extensions to index (README always included):", default_exts, default=[".py", ".md", ".txt"]
-)
-# Handle the "Load & Index" button click event.
-if st.button("Load & Index Repository", type="primary"):
-    # Run the indexing process within a try-except block to catch errors.
-    try:
-        # Validate that the URL and file extensions are provided.
-        if not url.strip():
-            st.error("Please enter a valid GitHub repository URL.")
-        elif not exts:
-            st.error("Please select at least one file extension.")
-        else:
-            # Trigger the repository indexing function.
-            index_repo(url.strip(), exts, chunk, overlap, k)
-    except Exception as e:
-        st.exception(e)
+    with st.sidebar:
+        st.header("Settings")
+        model = st.text_input("Ollama Chat Model", value="llama3.2")
+        k = st.slider("Top-K retrieved chunks", 2, 10, value=4)  # Number of chunks to retrieve for context
+        chunk = st.slider("Chunk size (chars)", 500, 2000, value=1200, step=100)  # Max characters per text chunk
+        overlap = st.slider("Chunk overlap (chars)", 0, 400, value=200, step=50)  # Character overlap between chunks
 
-# Initialize session state variables if they don't already exist.
-st.session_state.setdefault("messages", [])
-st.session_state.setdefault("retriever", None)
-st.session_state.setdefault("readme", "")
+    # Main panel for repository input and indexing controls.
+    default_exts = [".py", ".js", ".ts", ".md", ".txt", ".json", ".yaml", ".yml", ".java", ".go", ".rs"]
+    url = st.text_input("GitHub Repository URL", placeholder="https://github.com/owner/repo")
+    exts = st.multiselect(
+        "File extensions to index (README always included):", default_exts, default=[".py", ".md", ".txt"]
+    )
+    # Handle the "Load & Index" button click event.
+    if st.button("Load & Index Repository", type="primary"):
+        # Run the indexing process within a try-except block to catch errors.
+        try:
+            # Validate that the URL and file extensions are provided.
+            if not url.strip():
+                st.error("Please enter a valid GitHub repository URL.")
+            elif not exts:
+                st.error("Please select at least one file extension.")
+            else:
+                # Trigger the repository indexing function.
+                index_repo(url.strip(), exts, chunk, overlap, k)
+        except Exception as e:
+            st.exception(e)
 
-st.markdown("### Chat")
-# Display previous chat messages from the session state.
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+    # Initialize session state variables if they don't already exist.
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("retriever", None)
+    st.session_state.setdefault("readme", "")
 
-# Disable the chat input until a repository is successfully indexed.
-disabled = st.session_state.retriever is None or not st.session_state.readme
-user = st.chat_input("Ask about the repository's README or code...", disabled=disabled)
+    st.markdown("### Chat")
+    # Display previous chat messages from the session state.
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-# Process user input if a message is entered.
-if user:
-    # Add the user's message to the chat history.
-    st.session_state.messages.append({"role": "user", "content": user})
-    with st.chat_message("user"):
-        st.markdown(user)
-    # Generate and display the assistant's response.
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            # Get the answer from the RAG pipeline, handling potential errors.
-            try:
-                ans, used = answer(user, model)
-            except Exception as e:
-                ans, used = f"Error: {e}", []
-        st.markdown(ans)
-        # Add the assistant's response to the chat history.
-        st.session_state.messages.append({"role": "assistant", "content": ans})
-        # Display the source documents used to generate the answer.
-        if used:
-            with st.expander("Sources (retrieved snippets)"):
-                seen = set()
-                # Iterate through retrieved documents to show unique sources.
-                for d in used:
-                    src, url = d.metadata.get("source"), d.metadata.get("url")
-                    # Display each source file path only once.
-                    if src and src not in seen:
-                        seen.add(src)
-                        st.write(f"- {src}")
-                        # Display the URL to the source file on GitHub.
-                        if url:
-                            st.write(f"  {url}")
+    # Disable the chat input until a repository is successfully indexed.
+    disabled = st.session_state.retriever is None or not st.session_state.readme
+    user = st.chat_input("Ask about the repository's README or code...", disabled=disabled)
+
+    # Process user input if a message is entered.
+    if user:
+        # Add the user's message to the chat history.
+        st.session_state.messages.append({"role": "user", "content": user})
+        with st.chat_message("user"):
+            st.markdown(user)
+        # Generate and display the assistant's response.
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                # Get the answer from the RAG pipeline, handling potential errors.
+                try:
+                    ans, used = answer(user, model)
+                except Exception as e:
+                    ans, used = f"Error: {e}", []
+            st.markdown(ans)
+            # Add the assistant's response to the chat history.
+            st.session_state.messages.append({"role": "assistant", "content": ans})
+            # Display the source documents used to generate the answer.
+            if used:
+                with st.expander("Sources (retrieved snippets)"):
+                    seen = set()
+                    # Iterate through retrieved documents to show unique sources.
+                    for d in used:
+                        src, url = d.metadata.get("source"), d.metadata.get("url")
+                        # Display each source file path only once.
+                        if src and src not in seen:
+                            seen.add(src)
+                            st.write(f"- {src}")
+                            # Display the URL to the source file on GitHub.
+                            if url:
+                                st.write(f"  {url}")
+
+
+if __name__ == "__main__":
+    main()

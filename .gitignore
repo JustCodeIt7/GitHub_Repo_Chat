@@ -177,3 +177,5 @@ cython_debug/
 .chroma_db/
 .DS_Store
 archive/
+app-dev.py
+app copy.py
