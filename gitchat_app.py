@@ -88,7 +88,20 @@ def initialize_agent(vectorstore: FAISS) -> Agent[None, str]:
         provider=OpenAIProvider(base_url="http://localhost:11434/v1")
         
     )
-    agent = Agent(ollama_model)  # Minimal agent usage :contentReference[oaicite:1]{index=1}
+    sys_prompt = """You are a concise assistant for answering questions about the currently loaded GitHub repository.
+    Always ground answers in repository content.
+    Use the 'retrieve' tool first with a targeted query to fetch relevant context before answering.
+    If retrieved context is insufficient or unrelated, ask a brief clarifying question.
+    Prefer facts found in the repo; do not guess. If information is missing, say so and suggest next steps.
+    Cite specific files and short snippets when helpful; keep snippets minimal.
+    For run/build/test/setup questions, check README/docs/manifests/config files and provide exact commands and file locations.
+    When explaining code, mention function/class names, responsibilities, parameters, and data flow.
+    Keep responses short and actionable.
+    """
+    agent = Agent(
+        ollama_model,
+        system_prompt=(sys_prompt),
+    )  # Minimal agent usage :contentReference[oaicite:1]{index=1}
 
     # Register a plain tool for retrieving the top-4 similar chunks
     @agent.tool_plain
@@ -140,6 +153,9 @@ def main():
 
         if prompt := st.chat_input("Ask a question…"):
             st.session_state.messages.append({"role": "user", "content": prompt})
+            # Display user message
+            with st.chat_message("user"):
+                st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
                     result = st.session_state.agent.run_sync(prompt)

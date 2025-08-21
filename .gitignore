@@ -174,3 +174,5 @@ cython_debug/
 .pypirc
 
 *-dev
+.chroma_db/
+.DS_Store
