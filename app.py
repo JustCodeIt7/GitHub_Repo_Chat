@@ -1,329 +1,218 @@
-import os
-import re
-import shutil
-import tempfile
-import subprocess
-from pathlib import Path
-from typing import List, Tuple, Optional
-
-import streamlit as st
-
-# LangChain / Chroma / Ollama imports
+import re, requests, streamlit as st
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_community.chat_models import ChatOllama
+from langchain_community.vectorstores import Chroma
+from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+
+################################ Setup & Configuration ################################
+st.set_page_config(page_title="GitHub Repo Chat (RAG)", page_icon="💬", layout="wide")
+
+################################ GitHub API Utilities ################################
+# Set common headers for GitHub API requests
+H = {"Accept": "application/vnd.github+json", "User-Agent": "streamlit-rag-app"}
 
 
-# -------------------------------
-# Minimal helper utilities
-# -------------------------------
-
-def parse_github_url(repo_url: str) -> Tuple[str, str]:
-	"""Return (normalized_clone_url, repo_slug). Supports https and ssh URLs.
-
-	repo_slug example: owner/repo
-	"""
-	url = repo_url.strip()
-	if url.endswith(".git"):
-		url = url[:-4]
-	# Normalize SSH to HTTPS when possible for shallow clone without auth
-	m = re.match(r"git@github.com:(?P<owner>[^/]+)/(?P<repo>[^/]+)$", url)
-	if m:
-		clone_url = f"https://github.com/{m.group('owner')}/{m.group('repo')}.git"
-		slug = f"{m.group('owner')}/{m.group('repo')}"
-		return clone_url, slug
-
-	# HTTPS
-	m = re.match(r"https?://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)", url)
-	if m:
-		slug = f"{m.group('owner')}/{m.group('repo')}"
-		clone_url = f"https://github.com/{slug}.git"
-		return clone_url, slug
-
-	# Fallback - return as-is
-	return repo_url, Path(url).name
+def approx(text, max_tokens=2000, ratio=4):
+    """Truncate text to an approximate number of characters based on token count."""
+    mx = max_tokens * ratio
+    return text if len(text) <= mx else text[:mx] + "\n\n[...truncated...]"
 
 
-def shallow_clone(repo_url: str, dest_dir: Path) -> Path:
-	"""Shallow clone the repository to dest_dir. Returns the path to the repo root.
-	Raises RuntimeError on failure.
-	"""
-	if dest_dir.exists():
-		shutil.rmtree(dest_dir)
-	dest_dir.mkdir(parents=True, exist_ok=True)
-
-	try:
-		subprocess.run(
-			["git", "clone", "--depth", "1", repo_url, str(dest_dir)],
-			check=True,
-			stdout=subprocess.PIPE,
-			stderr=subprocess.PIPE,
-		)
-	except subprocess.CalledProcessError as e:
-		raise RuntimeError(f"Git clone failed: {e.stderr.decode(errors='ignore')}")
-	return dest_dir
+def parse(url):
+    """Extract owner and repo name from a GitHub URL."""
+    m = re.match(r"https?://github\.com/([^/\s]+)/([^/\s#?]+)", url or "")
+    if not m:
+        raise ValueError("Enter a valid GitHub URL like https://github.com/owner/repo")
+    owner, repo = m.group(1), m.group(2)
+    return owner, repo[:-4] if repo.endswith(".git") else repo  # Clean .git suffix
 
 
-def read_text_file(path: Path, max_bytes: int = 2_000_000) -> Optional[str]:
-	"""Read a file as UTF-8 text if it's not too large. Returns None if unreadable."""
-	try:
-		if path.stat().st_size > max_bytes:
-			return None
-		with path.open("r", encoding="utf-8", errors="ignore") as f:
-			return f.read()
-	except Exception:
-		return None
+def gh_json(url, timeout=30):
+    """Fetch JSON data from a GitHub API endpoint with error handling."""
+    r = requests.get(url, headers=H, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub API error {r.status_code}: {r.text[:200]}")
+    return r.json()
 
 
-def find_readme(repo_root: Path) -> Optional[Path]:
-	candidates = [
-		repo_root / "README.md",
-		repo_root / "README.MD",
-		repo_root / "README",
-		repo_root / "readme.md",
-		repo_root / "Readme.md",
-	]
-	for p in candidates:
-		if p.exists() and p.is_file():
-			return p
-	# Fallback: search top-level for any readme-like file
-	for p in repo_root.glob("*readme*" ):
-		if p.is_file():
-			return p
-	return None
+def default_branch(owner, repo):
+    """Get the default branch name for a repository."""
+    return gh_json(f"https://api.github.com/repos/{owner}/{repo}").get("default_branch", "main")
 
 
-def approx_trim_tokens(text: str, max_tokens: int = 2000) -> str:
-	"""Approximate token trimming assuming ~4 chars per token."""
-	if not text:
-		return ""
-	max_chars = max_tokens * 4
-	return text[:max_chars]
+def fetch_readme(owner, repo):
+    """Fetch the repository's README, trying the API first, then common filenames."""
+    # First, try the dedicated README API endpoint
+    r = requests.get(f"https://api.github.com/repos/{owner}/{repo}/readme", headers=H, timeout=30)
+    if r.status_code == 200 and (u := r.json().get("download_url")):
+        raw = requests.get(u, headers=H, timeout=30)
+        if raw.status_code == 200:
+            return raw.text
+    # Fallback: check for common README filenames on the default branch
+    branch = default_branch(owner, repo)
+    for name in ["README.md", "README.MD", "Readme.md", "readme.md", "README", "README.txt", "README.rst"]:
+        raw = requests.get(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{name}", headers=H, timeout=30)
+        if raw.status_code == 200 and raw.text.strip():
+            return raw.text
+    return "README not found or empty."
 
 
-def collect_repo_documents(repo_root: Path, exts: List[str]) -> List[Document]:
-	"""Walk repo and collect documents for given extensions, excluding README."""
-	exts = [e.lower().strip() for e in exts]
-	docs: List[Document] = []
-	for path in repo_root.rglob("*"):
-		if not path.is_file():
-			continue
-		if path.name.lower().startswith("readme"):
-			# README is handled separately
-			continue
-		if exts and path.suffix.lower() not in exts:
-			continue
-		content = read_text_file(path)
-		if not content:
-			continue
-		docs.append(Document(
-			page_content=content,
-			metadata={"source": str(path.relative_to(repo_root)), "repo_root": str(repo_root)}
-		))
-	return docs
+def list_paths(owner, repo, branch):
+    """Get a flat list of all file paths in the repository."""
+    # Recursively fetch the entire git tree for the specified branch
+    tree = gh_json(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", timeout=60).get(
+        "tree", []
+    )
+    # Filter for files (blobs) and return their paths
+    return [t["path"] for t in tree if t.get("type") == "blob"]
 
 
-def build_vectorstore(docs: List[Document], persist_dir: Path, embed_model: str = "nomic-embed-text") -> Chroma:
-	text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
-	splits = text_splitter.split_documents(docs)
-	embeddings = OllamaEmbeddings(model=embed_model, base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
-	vs = Chroma.from_documents(
-		documents=splits,
-		embedding=embeddings,
-		persist_directory=str(persist_dir),
-	)
-	# Persist to disk so re-runs are faster within the same session
-	vs.persist()
-	return vs
+def fetch_raw(owner, repo, branch, path, max_chars=300_000):
+    """Fetch the raw text content of a file, with validation."""
+    r = requests.get(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}", headers=H, timeout=60)
+    if r.status_code != 200:
+        return None
+    t = r.text
+    # Skip empty, oversized, or binary files
+    if not t.strip() or len(t) > max_chars or "\x00" in t:
+        return None
+    return t
 
 
-@st.cache_resource(show_spinner=False)
-def index_repo(repo_url: str, selected_exts: Tuple[str, ...], embed_model: str) -> Tuple[Chroma, str, str, Path]:
-	"""Clone and index the repo. Returns (vectorstore, readme_text, repo_slug, repo_root).
-
-	Cached by Streamlit per unique (url, exts, embed_model) across app session.
-	"""
-	clone_url, slug = parse_github_url(repo_url)
-	base_tmp = Path(tempfile.gettempdir()) / "repo_chat_cache"
-	base_tmp.mkdir(parents=True, exist_ok=True)
-	# Unique folder per url hash+exts
-	safe_slug = re.sub(r"[^a-zA-Z0-9._-]", "_", slug)
-	key = f"{safe_slug}-{'-'.join(sorted(selected_exts))}-{embed_model}"
-	repo_root = base_tmp / key
-
-	# Clone fresh each time for simplicity/reliability
-	shallow_clone(clone_url, repo_root)
-
-	# README
-	readme_path = find_readme(repo_root)
-	readme_text = approx_trim_tokens(read_text_file(readme_path) or "") if readme_path else ""
-
-	# Collect and index selected files
-	persist_dir = repo_root / ".chroma"
-	docs = collect_repo_documents(repo_root, list(selected_exts))
-
-	if docs:
-		vs = build_vectorstore(docs, persist_dir=persist_dir, embed_model=embed_model)
-	else:
-		# Create an empty store (Chroma requires embeddings; add tiny dummy document)
-		embeddings = OllamaEmbeddings(model=embed_model, base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
-		vs = Chroma.from_texts([""], embedding=embeddings, persist_directory=str(persist_dir))
-		vs.persist()
-
-	return vs, readme_text, slug, repo_root
+def format_docs(docs):
+    """Prepare retrieved documents for inclusion in the LLM prompt."""
+    return (
+        "\n\n-----\n\n".join(f"Source: {d.metadata.get('source', 'unknown')}\n{d.page_content}" for d in docs)
+        if docs
+        else "(no relevant snippets)"
+    )
 
 
-def format_context_block(readme_text: str, retrieved_docs: List[Document], max_chars: int = 12000) -> str:
-	parts = []
-	if readme_text:
-		parts.append("README (truncated):\n" + readme_text.strip())
-	if retrieved_docs:
-		parts.append("Relevant files:")
-		for i, d in enumerate(retrieved_docs, 1):
-			src = d.metadata.get("source", "")
-			text = d.page_content[:2000]  # cap each to keep prompt small
-			parts.append(f"[{i}] {src}\n{text}")
-	ctx = "\n\n".join(parts)
-	return ctx[:max_chars]
+################################ Indexing & RAG Logic ################################
+def index_repo(url, exts, chunk_size, overlap, k):
+    """Fetch, parse, chunk, and embed repository files into a vector store."""
+    owner, repo = parse(url)
+    branch = default_branch(owner, repo)
+    st.session_state.readme = approx(fetch_readme(owner, repo))
+    # Filter file paths based on selected extensions
+    paths = [p for p in list_paths(owner, repo, branch) if any(p.lower().endswith(e.lower()) for e in exts)]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+    docs = []
+    # Fetch, split, and create Document objects for each file
+    for p in paths:
+        if txt := fetch_raw(owner, repo, branch, p):
+            for j, s in enumerate(splitter.split_text(txt)):
+                docs.append(
+                    Document(
+                        page_content=s,
+                        metadata={
+                            "source": p,
+                            "repo": f"{owner}/{repo}",
+                            "branch": branch,
+                            "chunk": j,
+                            "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{p}",
+                        },
+                    )
+                )
+    # Initialize embedding model and vector store
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    vs = Chroma(embedding_function=embeddings)
+    if docs:
+        vs.add_documents(docs)  # Add processed documents to the vector store
+    # Create and store the retriever in the session state
+    st.session_state.retriever = vs.as_retriever(search_kwargs={"k": int(k)})
+    st.success(f"Indexed {len(docs)} chunks from {len(paths)} files.")
 
 
-def answer_question(
-	llm: ChatOllama,
-	retriever,
-	question: str,
-	readme_text: str,
-	chat_history: List[Tuple[str, str]],
-	k: int = 5,
-) -> str:
-	retrieved = retriever.get_relevant_documents(question)[:k] if retriever else []
-	context = format_context_block(readme_text, retrieved)
-
-	# Build a simple prompt that always includes README content + retrieved docs
-	system_instructions = (
-		"You are a coding assistant answering questions about a GitHub repository. "
-		"Use the README as the primary source of truth for high-level behavior. "
-		"Augment with retrieved code snippets when helpful. Quote file paths when citing. "
-		"If something is unclear or missing, say so and suggest where to look."
-	)
-
-	history_text = "\n\n".join([f"User: {u}\nAssistant: {a}" for u, a in chat_history[-6:]])  # last 6 exchanges
-
-	prompt = (
-		f"<SYSTEM>\n{system_instructions}\n</SYSTEM>\n\n"
-		f"<CONTEXT>\n{context}\n</CONTEXT>\n\n"
-		f"<HISTORY>\n{history_text}\n</HISTORY>\n\n"
-		f"<QUESTION>\n{question}\n</QUESTION>\n\n"
-		"Provide a concise, helpful answer. If you cite details, include the file path in parentheses."
-	)
-
-	resp = llm.invoke(prompt)
-	try:
-		return resp.content if hasattr(resp, "content") else str(resp)
-	except Exception:
-		return str(resp)
+def answer(question, model):
+    """Retrieve documents, build a prompt, and query the LLM to get an answer."""
+    if not st.session_state.get("retriever"):
+        return "Please index a repository first.", []
+    # Find documents relevant to the user's question
+    docs = st.session_state.retriever.get_relevant_documents(question)
+    ctx = format_docs(docs)
+    readme = st.session_state.get("readme") or "(no README found)"
+    # Construct the final prompt with context, README, and the question
+    prompt = (
+        "You are a helpful code assistant. Use the repository README (below) and retrieved code/document snippets "
+        "to answer questions. If you do not know, say so. Prefer citing file paths and lines when relevant.\n\n"
+        f"Repository README (truncated):\n{readme}\n\n"
+        f"Question: {question}\n\nRelevant snippets:\n{ctx}\n\n"
+        "Answer:"
+    )
+    llm = ChatOllama(model=model, temperature=0.2)  # Initialize the LLM
+    resp = llm.invoke(prompt)  # Get the model's response
+    return resp.content, docs
 
 
-# -------------------------------
-# Streamlit App
-# -------------------------------
-
-st.set_page_config(page_title="GitHub Repo Chat", page_icon="📚", layout="wide")
-
-st.title("GitHub Repo Chat — Streamlit + LangChain + Chroma (Ollama embeddings)")
-
-with st.sidebar:
-	st.markdown("""
-	Quick setup:
-	1) Install and run Ollama (https://ollama.com/) and pull models:
-	   - ollama pull nomic-embed-text
-	   - ollama pull llama3.1
-	2) pip install: streamlit langchain langchain-community chromadb
-	""")
-	gen_model = st.text_input("Generation model (Ollama)", value="llama3.1")
-	top_k = st.slider("Top K documents", 2, 10, 5)
-	temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
-
-repo_url = st.text_input("GitHub Repository URL", placeholder="https://github.com/owner/repo")
-
-ext_options = [".py", ".js", ".ts", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml"]
-selected_exts = st.multiselect(
-	"File extensions to include (README is always included)",
-	options=ext_options,
-	default=[".py", ".md", ".txt"],
+################################ Streamlit UI ################################
+st.title("💬 Chat with a GitHub Repository (LangChain + Chroma + Ollama)")
+st.write(
+    "Ask questions about a repo’s README and code. README is always included; selected file types are embedded for retrieval."
 )
 
-col1, col2 = st.columns([1, 3])
-with col1:
-	load_clicked = st.button("Load Repository", type="primary", use_container_width=True)
+with st.sidebar:
+    st.header("Settings")
+    model = st.text_input("Ollama Chat Model", value="llama3.2")
+    k = st.slider("Top-K retrieved chunks", 2, 10, value=4)  # Number of chunks to retrieve
+    chunk = st.slider("Chunk size (chars)", 500, 2000, value=1200, step=100)  # Max characters per chunk
+    overlap = st.slider("Chunk overlap (chars)", 0, 400, value=200, step=50)  # Character overlap between chunks
 
-status_placeholder = st.empty()
+# Main panel for repository input and indexing controls
+default_exts = [".py", ".js", ".ts", ".md", ".txt", ".json", ".yaml", ".yml", ".java", ".go", ".rs"]
+url = st.text_input("GitHub Repository URL", placeholder="https://github.com/owner/repo")
+exts = st.multiselect(
+    "File extensions to index (README always included):", default_exts, default=[".py", ".md", ".txt"]
+)
+if st.button("Load & Index Repository", type="primary"):
+    try:
+        # Validate inputs before starting the indexing process
+        if not url.strip():
+            st.error("Please enter a valid GitHub repository URL.")
+        elif not exts:
+            st.error("Please select at least one file extension.")
+        else:
+            index_repo(url.strip(), exts, chunk, overlap, k)
+    except Exception as e:
+        st.exception(e)
 
-if "chat_history" not in st.session_state:
-	st.session_state.chat_history = []  # List[Tuple[user, assistant]]
+# Initialize session state variables if they don't exist
+st.session_state.setdefault("messages", [])
+st.session_state.setdefault("retriever", None)
+st.session_state.setdefault("readme", "")
 
-if "retriever" not in st.session_state:
-	st.session_state.retriever = None
+st.markdown("### Chat")
+# Display previous chat messages
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-if load_clicked:
-	if not repo_url.strip():
-		st.warning("Please enter a GitHub repository URL.")
-	else:
-		status_placeholder.info("Cloning and indexing repository… This may take a minute on first run.")
-		try:
-			vectorstore, readme_text, slug, repo_root = index_repo(repo_url.strip(), tuple(selected_exts), "nomic-embed-text")
-			st.session_state.readme_text = readme_text
-			st.session_state.repo_slug = slug
-			st.session_state.repo_root = str(repo_root)
-			st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": top_k})
-			status_placeholder.success(f"Loaded {slug}. You can start chatting below.")
-		except Exception as e:
-			status_placeholder.error(f"Failed to load repo: {e}")
+# Disable chat input until a repository is indexed
+disabled = st.session_state.retriever is None or not st.session_state.readme
+user = st.chat_input("Ask about the repository's README or code...", disabled=disabled)
 
-
-if st.session_state.get("retriever") is not None:
-	st.subheader(f"Chatting about: {st.session_state.get('repo_slug', '')}")
-
-	# Show README preview
-	with st.expander("README (always included in context) — preview"):
-		st.write(st.session_state.get("readme_text", "(No README found)"))
-
-	# Render chat history
-	for user_msg, assistant_msg in st.session_state.chat_history:
-		with st.chat_message("user"):
-			st.markdown(user_msg)
-		with st.chat_message("assistant"):
-			st.markdown(assistant_msg)
-
-	user_input = st.chat_input("Ask a question about this repository…")
-
-	if user_input:
-		with st.chat_message("user"):
-			st.markdown(user_input)
-
-		# Create LLM per request (fast) so sliders take effect
-		llm = ChatOllama(model=gen_model, temperature=temperature, base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
-
-		with st.chat_message("assistant"):
-			with st.spinner("Thinking…"):
-				try:
-					answer = answer_question(
-						llm=llm,
-						retriever=st.session_state.retriever,
-						question=user_input,
-						readme_text=st.session_state.get("readme_text", ""),
-						chat_history=st.session_state.chat_history,
-						k=top_k,
-					)
-				except Exception as e:
-					answer = f"Sorry, there was an error generating the answer: {e}"
-			st.markdown(answer)
-
-		# Save to history
-		st.session_state.chat_history.append((user_input, answer))
-
-
-else:
-	st.info("Enter a GitHub repo URL, choose file types, and click Load Repository to begin.")
-
+# Process user input and generate a response
+if user:
+    st.session_state.messages.append({"role": "user", "content": user})
+    with st.chat_message("user"):
+        st.markdown(user)
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                ans, used = answer(user, model)  # Generate answer using RAG
+            except Exception as e:
+                ans, used = f"Error: {e}", []
+        st.markdown(ans)
+        st.session_state.messages.append({"role": "assistant", "content": ans})
+        # Display the sources (retrieved documents) used for the answer
+        if used:
+            with st.expander("Sources (retrieved snippets)"):
+                seen = set()
+                for d in used:
+                    src, url = d.metadata.get("source"), d.metadata.get("url")
+                    if src and src not in seen:
+                        seen.add(src)
+                        st.write(f"- {src}")
+                        if url:
+                            st.write(f"  {url}")
