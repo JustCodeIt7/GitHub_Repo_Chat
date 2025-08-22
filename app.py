@@ -1,4 +1,5 @@
-import re, requests, streamlit as st
+import re, requests
+import streamlit as st
 from langchain_community.vectorstores import Chroma
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
